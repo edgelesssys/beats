@@ -160,8 +160,8 @@ shared:
   - &docker_spec
     <<: *binary_spec
     extra_vars:
-      from: 'ubuntu:20.04'
-      buildFrom: 'ubuntu:20.04'
+      from: 'ubuntu:22.04'
+      buildFrom: 'ubuntu:22.04'
       user: '{{ .BeatName }}'
       linux_capabilities: ''
     files:
@@ -173,8 +173,8 @@ shared:
   - &docker_arm_spec
     <<: *docker_spec
     extra_vars:
-      from: 'arm64v8/ubuntu:20.04'
-      buildFrom: 'arm64v8/ubuntu:20.04'
+      from: 'arm64v8/ubuntu:22.04'
+      buildFrom: 'arm64v8/ubuntu:22.04'
 
   - &docker_ubi_spec
     extra_vars:
