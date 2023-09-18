@@ -73,7 +73,17 @@ func Plugin(log *logp.Logger, store inputcursor.StateStore) v2.Plugin {
 	}
 }
 
-type input struct{}
+type input struct {
+	time func() time.Time
+}
+
+// now is time.Now with a modifiable time source.
+func (i input) now() time.Time {
+	if i.time == nil {
+		return time.Now()
+	}
+	return i.time()
+}
 
 func (input) Name() string { return inputName }
 
@@ -107,7 +117,7 @@ func sanitizeFileName(name string) string {
 	return strings.ReplaceAll(name, string(filepath.Separator), "_")
 }
 
-func (input) run(env v2.Context, src *source, cursor map[string]interface{}, pub inputcursor.Publisher) error {
+func (i input) run(env v2.Context, src *source, cursor map[string]interface{}, pub inputcursor.Publisher) error {
 	cfg := src.cfg
 	log := env.Logger.With("input_url", cfg.Resource.URL)
 
@@ -216,11 +226,11 @@ func (input) run(env v2.Context, src *source, cursor map[string]interface{}, pub
 			}
 
 			// Process a set of event requests.
-			log.Debugw("request state", logp.Namespace("cel"), "state", redactor{state: state, mask: cfg.Redact.Fields, delete: cfg.Redact.Delete})
+			log.Debugw("request state", logp.Namespace("cel"), "state", redactor{state: state, cfg: cfg.Redact})
 			metrics.executions.Add(1)
-			start := time.Now()
-			state, err = evalWith(ctx, prg, state)
-			log.Debugw("response state", logp.Namespace("cel"), "state", redactor{state: state, mask: cfg.Redact.Fields, delete: cfg.Redact.Delete})
+			start := i.now()
+			state, err = evalWith(ctx, prg, state, start)
+			log.Debugw("response state", logp.Namespace("cel"), "state", redactor{state: state, cfg: cfg.Redact})
 			if err != nil {
 				switch {
 				case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
@@ -896,8 +906,20 @@ func newProgram(ctx context.Context, src, root string, client *http.Client, limi
 	return prg, nil
 }
 
-func evalWith(ctx context.Context, prg cel.Program, state map[string]interface{}) (map[string]interface{}, error) {
-	out, _, err := prg.ContextEval(ctx, map[string]interface{}{root: state})
+func evalWith(ctx context.Context, prg cel.Program, state map[string]interface{}, now time.Time) (map[string]interface{}, error) {
+	out, _, err := prg.ContextEval(ctx, map[string]interface{}{
+		// Replace global program "now" with current time. This is necessary
+		// as the lib.Time now global is static at program instantiation time
+		// which will persist over multiple evaluations. The lib.Time behaviour
+		// is correct for mito where CEL program instances live for only a
+		// single evaluation. Rather than incurring the cost of creating a new
+		// cel.Program for each evaluation, shadow lib.Time's now with a new
+		// value for each eval. We retain the lib.Time now global for
+		// compatibility between CEL programs developed in mito with programs
+		// run in the input.
+		"now": now,
+		root:  state,
+	})
 	if e := ctx.Err(); e != nil {
 		err = e
 	}
@@ -952,7 +974,7 @@ func test(url *url.URL) error {
 
 	_, err := net.DialTimeout("tcp", net.JoinHostPort(url.Hostname(), port), time.Second)
 	if err != nil {
-		return fmt.Errorf("url %q is unreachable", url)
+		return fmt.Errorf("url %q is unreachable: %w", url, err)
 	}
 
 	return nil
@@ -999,21 +1021,20 @@ func (m *inputMetrics) Close() {
 
 // redactor implements lazy field redaction of sets of a mapstr.M.
 type redactor struct {
-	state  mapstr.M
-	mask   []string // mask is the set of dotted paths to redact from state.
-	delete bool     // if delete is true, delete redacted fields instead of showing a redaction.
+	state mapstr.M
+	cfg   *redact
 }
 
 // String renders the JSON corresponding to r.state after applying redaction
 // operations.
 func (r redactor) String() string {
-	if len(r.mask) == 0 {
+	if r.cfg == nil || len(r.cfg.Fields) == 0 {
 		return r.state.String()
 	}
 	c := make(mapstr.M, len(r.state))
 	cloneMap(c, r.state)
-	for _, mask := range r.mask {
-		if r.delete {
+	for _, mask := range r.cfg.Fields {
+		if r.cfg.Delete {
 			walkMap(c, mask, func(parent mapstr.M, key string) {
 				delete(parent, key)
 			})

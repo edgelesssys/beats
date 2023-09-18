@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -267,19 +268,38 @@ func (p *azure) doFetch(ctx context.Context, state *stateStore, fullSync bool) (
 		groupsDeltaLink = state.groupsLink
 	}
 
-	changedUsers, userLink, err := p.fetcher.Users(ctx, usersDeltaLink)
-	if err != nil {
-		return updatedUsers, updatedDevices, err
+	var (
+		changedUsers []*fetcher.User
+		userLink     string
+	)
+	switch strings.ToLower(p.conf.Dataset) {
+	case "", "all", "users":
+		changedUsers, userLink, err = p.fetcher.Users(ctx, usersDeltaLink)
+		if err != nil {
+			return updatedUsers, updatedDevices, err
+		}
+		p.logger.Debugf("Received %d users from API", len(changedUsers))
+	default:
+		p.logger.Debugf("Skipping user collection from API: dataset=%s", p.conf.Dataset)
 	}
-	p.logger.Debugf("Received %d users from API", len(changedUsers))
 
-	changedDevices, deviceLink, err := p.fetcher.Devices(ctx, devicesDeltaLink)
-	if err != nil {
-		return updatedUsers, updatedDevices, err
+	var (
+		changedDevices []*fetcher.Device
+		deviceLink     string
+	)
+	switch strings.ToLower(p.conf.Dataset) {
+	case "", "all", "devices":
+		changedDevices, deviceLink, err = p.fetcher.Devices(ctx, devicesDeltaLink)
+		if err != nil {
+			return updatedUsers, updatedDevices, err
+		}
+		p.logger.Debugf("Received %d devices from API", len(changedDevices))
+	default:
+		p.logger.Debugf("Skipping device collection from API: dataset=%s", p.conf.Dataset)
 	}
-	p.logger.Debugf("Received %d devices from API", len(changedUsers))
 
-	// Get group changes.
+	// Get group changes. Groups are required for both users and devices.
+	// So always collect these.
 	changedGroups, groupLink, err := p.fetcher.Groups(ctx, groupsDeltaLink)
 	if err != nil {
 		return updatedUsers, updatedDevices, err
@@ -489,6 +509,36 @@ func (p *azure) publishDevice(d *fetcher.Device, state *stateStore, inputID stri
 	})
 	if len(groups) != 0 {
 		_, _ = deviceDoc.Put("device.group", groups)
+	}
+
+	owners := make([]mapstr.M, 0, d.RegisteredOwners.Len())
+	d.RegisteredOwners.ForEach(func(userID uuid.UUID) {
+		u, ok := state.users[userID]
+		if !ok {
+			p.logger.Warnf("Unable to lookup registered owner %q for device %q", userID, d.ID)
+			return
+		}
+		m := u.Fields.Clone()
+		_, _ = m.Put("user.id", u.ID.String())
+		owners = append(owners, m)
+	})
+	if len(owners) != 0 {
+		_, _ = deviceDoc.Put("device.registered_owners", owners)
+	}
+
+	users := make([]mapstr.M, 0, d.RegisteredUsers.Len())
+	d.RegisteredUsers.ForEach(func(userID uuid.UUID) {
+		u, ok := state.users[userID]
+		if !ok {
+			p.logger.Warnf("Unable to lookup registered user %q for device %q", userID, d.ID)
+			return
+		}
+		m := u.Fields.Clone()
+		_, _ = m.Put("user.id", u.ID.String())
+		users = append(users, m)
+	})
+	if len(users) != 0 {
+		_, _ = deviceDoc.Put("device.registered_users", users)
 	}
 
 	event := beat.Event{

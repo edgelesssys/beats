@@ -18,6 +18,7 @@
 package filestream
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -198,6 +199,12 @@ func (w *fileWatcher) watch(ctx unison.Canceler) {
 
 	// remaining files in newFiles are newly created files
 	for path, fd := range newFilesByName {
+		// no need to react on empty new files
+		if fd.Info.Size() == 0 {
+			w.log.Warnf("file %q has no content yet, skipping", fd.Filename)
+			delete(paths, path)
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -350,7 +357,8 @@ func (s *fileScanner) GetFiles() map[string]loginp.FileDescriptor {
 	fdByName := map[string]loginp.FileDescriptor{}
 	// used to determine if a symlink resolves in a already known target
 	uniqueIDs := map[string]string{}
-
+	// used to filter out duplicate matches
+	uniqueFiles := map[string]struct{}{}
 	for _, path := range s.paths {
 		matches, err := filepath.Glob(path)
 		if err != nil {
@@ -359,6 +367,12 @@ func (s *fileScanner) GetFiles() map[string]loginp.FileDescriptor {
 		}
 
 		for _, filename := range matches {
+			// in case multiple globs match on the same file we filter out duplicates
+			if _, knownFile := uniqueFiles[filename]; knownFile {
+				continue
+			}
+			uniqueFiles[filename] = struct{}{}
+
 			it, err := s.getIngestTarget(filename)
 			if err != nil {
 				s.log.Debugf("cannot create an ingest target for file %q: %s", filename, err)
@@ -427,7 +441,8 @@ func (s *fileScanner) getIngestTarget(filename string) (it ingestTarget, err err
 
 		it.originalFilename, err = filepath.EvalSymlinks(it.filename)
 		if err != nil {
-			return it, fmt.Errorf("failed to resolve the symlink %q: %w", it.filename, err)
+			s.log.Debugf("finding path to original file has failed %s: %+v", it.filename, err)
+			it.originalFilename = it.filename
 		}
 
 		if s.isFileExcluded(it.originalFilename) {
@@ -453,7 +468,6 @@ func (s *fileScanner) toFileDescriptor(it *ingestTarget) (fd loginp.FileDescript
 			return fd, fmt.Errorf("filesize of %q is %d bytes, expected at least %d bytes for fingerprinting", fd.Filename, fileSize, minSize)
 		}
 
-		h := sha256.New()
 		file, err := os.Open(it.originalFilename)
 		if err != nil {
 			return fd, fmt.Errorf("failed to open %q for fingerprinting: %w", it.originalFilename, err)
@@ -467,9 +481,10 @@ func (s *fileScanner) toFileDescriptor(it *ingestTarget) (fd loginp.FileDescript
 			}
 		}
 
-		r := io.LimitReader(file, s.cfg.Fingerprint.Length)
-		buf := make([]byte, h.BlockSize())
-		written, err := io.CopyBuffer(h, r, buf)
+		bfile := bufio.NewReaderSize(file, int(s.cfg.Fingerprint.Length))
+		r := io.LimitReader(bfile, s.cfg.Fingerprint.Length)
+		h := sha256.New()
+		written, err := io.Copy(h, r)
 		if err != nil {
 			return fd, fmt.Errorf("failed to compute hash for first %d bytes of %q: %w", s.cfg.Fingerprint.Length, fd.Filename, err)
 		}
