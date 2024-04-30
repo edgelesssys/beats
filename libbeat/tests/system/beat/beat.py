@@ -717,6 +717,7 @@ class TestCase(unittest.TestCase, ComposeMixin):
             if not os.path.isfile(path):
                 path = os.path.abspath(os.path.dirname(
                     __file__) + "../../../../_meta/fields.common.yml")
+
             with open(path, encoding="utf-8") as f2:
                 content = f2.read()
 
@@ -788,7 +789,7 @@ class TestCase(unittest.TestCase, ComposeMixin):
     def assert_fields_are_documented(self, evt):
         """
         Assert that all keys present in evt are documented in fields.yml.
-        This reads from the global fields.yml, means `make collect` has to be run before the check.
+        This reads from the global fields.yml, means `mage fields` has to be run before the check.
         """
         expected_fields, dict_fields, aliases = self.load_fields()
         flat = self.flatten_object(evt, dict_fields)
@@ -813,16 +814,25 @@ class TestCase(unittest.TestCase, ComposeMixin):
                     return True
             return False
 
+        undocumented_keys = []
+        is_documented_aliases = []
+
         for key in flat.keys():
             meta_key = key.startswith('@metadata.')
             # Range keys as used in 'date_range' etc will not have docs of course
             is_range_key = key.split('.')[-1] in ['gte', 'gt', 'lte', 'lt']
+
             if not(is_documented(key, expected_fields) or meta_key or is_range_key):
-                raise Exception(
-                    f"Key '{key}' found in event ({str(evt)}) is not documented!")
+                undocumented_keys.append(key)
+
             if is_documented(key, aliases):
-                raise Exception(
-                    "Key '{key}' found in event is documented as an alias!")
+                is_documented_aliases.append(key)
+
+        if undocumented_keys:
+            raise Exception(f"Keys {undocumented_keys} not documented in event {str(evt)}")
+
+        if is_documented_aliases:
+            raise Exception(f"Keys {is_documented_aliases} documented as aliases!")
 
     def get_beat_version(self):
         """

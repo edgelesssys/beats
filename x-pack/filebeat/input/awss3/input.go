@@ -13,6 +13,7 @@ import (
 	"time"
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/smithy-go"
@@ -21,7 +22,6 @@ import (
 	v2 "github.com/elastic/beats/v7/filebeat/input/v2"
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/feature"
-	"github.com/elastic/beats/v7/libbeat/statestore"
 	awscommon "github.com/elastic/beats/v7/x-pack/libbeat/common/aws"
 	conf "github.com/elastic/elastic-agent-libs/config"
 	"github.com/elastic/go-concert/unison"
@@ -99,32 +99,7 @@ func (in *s3Input) Test(ctx v2.TestContext) error {
 }
 
 func (in *s3Input) Run(inputContext v2.Context, pipeline beat.Pipeline) error {
-	var err error
-
-	persistentStore, err := in.store.Access()
-	if err != nil {
-		return fmt.Errorf("can not access persistent store: %w", err)
-	}
-
-	defer persistentStore.Close()
-
-	states := newStates(inputContext)
-	err = states.readStatesFrom(persistentStore)
-	if err != nil {
-		return fmt.Errorf("can not start persistent store: %w", err)
-	}
-
-	// Wrap input Context's cancellation Done channel a context.Context. This
-	// goroutine stops with the parent closes the Done channel.
-	ctx, cancelInputCtx := context.WithCancel(context.Background())
-	go func() {
-		defer cancelInputCtx()
-		select {
-		case <-inputContext.Cancelation.Done():
-		case <-ctx.Done():
-		}
-	}()
-	defer cancelInputCtx()
+	ctx := v2.GoContextFromCanceler(inputContext.Cancelation)
 
 	if in.config.QueueURL != "" {
 		regionName, err := getRegionFromQueueURL(in.config.QueueURL, in.config.AWSConfig.Endpoint, in.config.RegionName)
@@ -156,7 +131,6 @@ func (in *s3Input) Run(inputContext v2.Context, pipeline beat.Pipeline) error {
 	if in.config.BucketARN != "" || in.config.NonAWSBucketName != "" {
 		// Create client for publishing events and receive notification of their ACKs.
 		client, err := pipeline.ConnectWith(beat.ClientConfig{
-			CloseRef:      inputContext.Cancelation,
 			EventListener: awscommon.NewEventACKHandler(),
 			Processing: beat.ProcessingConfig{
 				// This input only produces events with basic types so normalization
@@ -169,8 +143,20 @@ func (in *s3Input) Run(inputContext v2.Context, pipeline beat.Pipeline) error {
 		}
 		defer client.Close()
 
+		// Connect to the registry and create our states lookup
+		persistentStore, err := in.store.Access()
+		if err != nil {
+			return fmt.Errorf("can not access persistent store: %w", err)
+		}
+		defer persistentStore.Close()
+
+		states, err := newStates(inputContext, persistentStore)
+		if err != nil {
+			return fmt.Errorf("can not start persistent store: %w", err)
+		}
+
 		// Create S3 receiver and S3 notification processor.
-		poller, err := in.createS3Lister(inputContext, ctx, client, persistentStore, states)
+		poller, err := in.createS3Lister(inputContext, ctx, client, states)
 		if err != nil {
 			return fmt.Errorf("failed to initialize s3 poller: %w", err)
 		}
@@ -241,7 +227,7 @@ func (n nonAWSBucketResolver) ResolveEndpoint(region string, options s3.Endpoint
 	return awssdk.Endpoint{URL: n.endpoint, SigningRegion: region, HostnameImmutable: true, Source: awssdk.EndpointSourceCustom}, nil
 }
 
-func (in *s3Input) createS3Lister(ctx v2.Context, cancelCtx context.Context, client beat.Client, persistentStore *statestore.Store, states *states) (*s3Poller, error) {
+func (in *s3Input) createS3Lister(ctx v2.Context, cancelCtx context.Context, client beat.Client, states *states) (*s3Poller, error) {
 	var bucketName string
 	var bucketID string
 	if in.config.NonAWSBucketName != "" {
@@ -261,6 +247,12 @@ func (in *s3Input) createS3Lister(ctx v2.Context, cancelCtx context.Context, cli
 			o.EndpointOptions.UseFIPSEndpoint = awssdk.FIPSEndpointStateEnabled
 		}
 		o.UsePathStyle = in.config.PathStyle
+
+		o.Retryer = retry.NewStandard(func(so *retry.StandardOptions) {
+			so.MaxAttempts = 5
+			// Recover quickly when requests start working again
+			so.NoRetryIncrement = 100
+		})
 	})
 	regionName, err := getRegionForBucket(cancelCtx, s3Client, bucketName)
 	if err != nil {
@@ -306,7 +298,6 @@ func (in *s3Input) createS3Lister(ctx v2.Context, cancelCtx context.Context, cli
 		client,
 		s3EventHandlerFactory,
 		states,
-		persistentStore,
 		bucketID,
 		in.config.BucketListPrefix,
 		in.awsConfig.Region,
@@ -317,18 +308,20 @@ func (in *s3Input) createS3Lister(ctx v2.Context, cancelCtx context.Context, cli
 	return s3Poller, nil
 }
 
-var errBadQueueURL = errors.New("QueueURL is not in format: https://sqs.{REGION_ENDPOINT}.{ENDPOINT}/{ACCOUNT_NUMBER}/{QUEUE_NAME}")
+var errBadQueueURL = errors.New("QueueURL is not in format: https://sqs.{REGION_ENDPOINT}.{ENDPOINT}/{ACCOUNT_NUMBER}/{QUEUE_NAME} or https://{VPC_ENDPOINT}.sqs.{REGION_ENDPOINT}.vpce.{ENDPOINT}/{ACCOUNT_NUMBER}/{QUEUE_NAME}")
 
 func getRegionFromQueueURL(queueURL string, endpoint, defaultRegion string) (region string, err error) {
 	// get region from queueURL
-	// Example: https://sqs.us-east-1.amazonaws.com/627959692251/test-s3-logs
+	// Example for sqs queue: https://sqs.us-east-1.amazonaws.com/12345678912/test-s3-logs
+	// Example for vpce: https://vpce-test.sqs.us-east-1.vpce.amazonaws.com/12345678912/sqs-queue
 	u, err := url.Parse(queueURL)
 	if err != nil {
 		return "", fmt.Errorf(queueURL + " is not a valid URL")
 	}
 	if (u.Scheme == "https" || u.Scheme == "http") && u.Host != "" {
 		queueHostSplit := strings.SplitN(u.Host, ".", 3)
-		if len(queueHostSplit) == 3 {
+		// check for sqs queue url
+		if len(queueHostSplit) == 3 && queueHostSplit[0] == "sqs" {
 			if queueHostSplit[2] == endpoint || (endpoint == "" && strings.HasPrefix(queueHostSplit[2], "amazonaws.")) {
 				region = queueHostSplit[1]
 				if defaultRegion != "" && region != defaultRegion {
@@ -336,7 +329,21 @@ func getRegionFromQueueURL(queueURL string, endpoint, defaultRegion string) (reg
 				}
 				return region, nil
 			}
-		} else if defaultRegion != "" {
+		}
+
+		// check for vpce url
+		queueHostSplitVPC := strings.SplitN(u.Host, ".", 5)
+		if len(queueHostSplitVPC) == 5 && queueHostSplitVPC[1] == "sqs" {
+			if queueHostSplitVPC[4] == endpoint || (endpoint == "" && strings.HasPrefix(queueHostSplitVPC[4], "amazonaws.")) {
+				region = queueHostSplitVPC[2]
+				if defaultRegion != "" && region != defaultRegion {
+					return defaultRegion, regionMismatchError{queueURLRegion: region, defaultRegion: defaultRegion}
+				}
+				return region, nil
+			}
+		}
+
+		if defaultRegion != "" {
 			return defaultRegion, nil
 		}
 	}
